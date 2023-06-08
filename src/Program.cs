@@ -1,12 +1,9 @@
 using System.Diagnostics;
-using System.Text;
-using Google.Protobuf.WellKnownTypes;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.OpenIdConnect;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Identity.Web;
 using Microsoft.Identity.Web.UI;
-using Microsoft.IdentityModel.Tokens;
 using OpenTelemetry;
 using OpenTelemetry.Context.Propagation;
 using OpenTelemetry.Resources;
@@ -20,19 +17,29 @@ builder.Services.AddOpenTelemetry()
     .ConfigureResource(r => r.AddService("oauth-application"))
     .WithTracing(b =>
     {
-        b.ConfigureResource(r => r.AddService("oauth-application"))
+        b
          .AddAspNetCoreInstrumentation()
-         .AddHoneycomb(builder.Configuration);
+         .SetSampler(new AlwaysOnSampler())
+        //  .AddOtlpExporter(opt => {
+        //     opt.Endpoint = new Uri("https://api.honeycomb.io:443/v1/traces");
+        //     opt.Headers = string.Join(",", new List<string>
+        //     {
+        //         $"x-otlp-version=0.16.0",
+        //         $"x-honeycomb-team={builder.Configuration.GetValue<string>("Honeycomb:ApiKey")}",
+        //     });
+        //  })
+         .AddHoneycomb(builder.Configuration)
+         .AddConsoleExporter();
     });
 
-
-var dataProtector = DataProtectionProvider.Create("my provider").CreateProtector("mypurpose");
+var dataProtector = DataProtectionProvider.Create("armadillo").CreateProtector("garden");
 
 builder.Services.ConfigureOpenTelemetryTracerProvider((sp, tp) =>
 {
     Sdk.SetDefaultTextMapPropagator(new CompositeTextMapPropagator(
         new List<TextMapPropagator>() {
-            new OIDCTracePropagator(dataProtector)
+            new OIDCTracePropagator(dataProtector),
+            new BaggagePropagator()
         }));
 });
 
@@ -47,20 +54,13 @@ builder.Services.AddAuthentication(OpenIdConnectDefaults.AuthenticationScheme)
             i.StateDataFormat = new PropertiesDataFormat(dataProtector);
             i.Events.OnRedirectToIdentityProvider = context =>
             {
-                context.ProtocolMessage.State = "This is the user state";
-
                 Propagators.DefaultTextMapPropagator.Inject(
-                    new PropagationContext(Activity.Current?.Context ?? new ActivityContext(), Baggage.Current), 
-                    context.Properties.Items, (items, key, value) => {
-                        items.Add(key, value);
+                    new PropagationContext(Activity.Current?.Context ?? new ActivityContext(), Baggage.Current),
+                    context.Properties.Items, (objectToAddTo, keyToSet, valueToSetTo) =>
+                    {
+                        objectToAddTo.Add(keyToSet, valueToSetTo);
                     });
-                Console.WriteLine($"Original TraceId: {Activity.Current.TraceId.ToString()}");
 
-                return Task.CompletedTask;
-            };
-            i.Events.OnTokenValidated = context =>
-            {
-                Console.WriteLine($"State Parameter was: {context.ProtocolMessage.State}");
                 return Task.CompletedTask;
             };
         });
@@ -100,43 +100,49 @@ app.Run();
 public class OIDCTracePropagator : TraceContextPropagator
 {
     private readonly IDataProtector _dataProtector;
+    private readonly TraceContextPropagator _internalPropagator = new();
 
     public OIDCTracePropagator(IDataProtector dataProtector)
     {
         _dataProtector = dataProtector;
     }
 
-    public override PropagationContext Extract<T>(PropagationContext context, T carrier, Func<T, string, IEnumerable<string>> getter)
+    public override PropagationContext Extract<T>(PropagationContext currentContext, T carrier, Func<T, string, IEnumerable<string>> getter)
     {
+        var baseContext = base.Extract(currentContext, carrier, getter);
+        if (baseContext.ActivityContext.IsValid())
+        {
+            return baseContext;
+        }
 
-        var request = carrier as HttpRequest;
-        if (request != null &&
+        if (carrier is HttpRequest request &&
             request.Path.HasValue &&
             request.Path.Value == "/signin-oidc")
         {
             var form = request.ReadFormAsync().GetAwaiter().GetResult();
             var dataFormat = new PropertiesDataFormat(_dataProtector);
-            
+
             var unprotectedState = dataFormat.Unprotect(form["state"]);
-            context = Propagators.DefaultTextMapPropagator.Extract(
-                context,
+
+            var contextFromAuthProperties = _internalPropagator.Extract(
+                currentContext,
                 unprotectedState.Items,
-                (items, key) => {
-                    return items.ContainsKey(key) ? 
-                        new List<string> { items[key] } :
+                (dictionaryOfStateValues, keyToFind) =>
+                {
+                    return dictionaryOfStateValues.ContainsKey(keyToFind) ?
+                        new List<string> { dictionaryOfStateValues[keyToFind] } :
                         Enumerable.Empty<string>();
                 });
 
-            Console.WriteLine($"New TraceId: {context.ActivityContext.TraceId.ToString()}");
-
-            return context;
+            return new PropagationContext(
+                contextFromAuthProperties.ActivityContext, contextFromAuthProperties.Baggage);
         }
-        return base.Extract<T>(context, carrier, getter);
+        return currentContext;
     }
 
     public override void Inject<T>(PropagationContext context, T carrier, Action<T, string, string> setter)
     {
-        base.Inject(context, carrier, setter);
+        _internalPropagator.Inject(context, carrier, setter);
     }
 
 }
