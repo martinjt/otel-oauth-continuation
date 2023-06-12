@@ -20,19 +20,11 @@ builder.Services.AddOpenTelemetry()
         b
          .AddAspNetCoreInstrumentation()
          .SetSampler(new AlwaysOnSampler())
-        //  .AddOtlpExporter(opt => {
-        //     opt.Endpoint = new Uri("https://api.honeycomb.io:443/v1/traces");
-        //     opt.Headers = string.Join(",", new List<string>
-        //     {
-        //         $"x-otlp-version=0.16.0",
-        //         $"x-honeycomb-team={builder.Configuration.GetValue<string>("Honeycomb:ApiKey")}",
-        //     });
-        //  })
          .AddHoneycomb(builder.Configuration)
          .AddConsoleExporter();
     });
 
-var dataProtector = DataProtectionProvider.Create("armadillo").CreateProtector("garden");
+var dataProtector = DataProtectionProvider.Create("oidc").CreateProtector("state-encryption");
 
 builder.Services.ConfigureOpenTelemetryTracerProvider((sp, tp) =>
 {
@@ -48,27 +40,22 @@ builder.Services.AddRazorPages()
     .AddMicrosoftIdentityUI();
 
 builder.Services.AddAuthentication(OpenIdConnectDefaults.AuthenticationScheme)
-        .AddMicrosoftIdentityWebApp(i =>
+    .AddMicrosoftIdentityWebApp((Action<MicrosoftIdentityOptions>)(i =>
+    {
+        builder.Configuration.GetSection("AzureADB2C").Bind(i);
+        i.StateDataFormat = new PropertiesDataFormat(dataProtector);
+        i.Events.OnRedirectToIdentityProvider = context =>
         {
-            builder.Configuration.GetSection("AzureADB2C").Bind(i);
-            i.StateDataFormat = new PropertiesDataFormat(dataProtector);
-            i.Events.OnRedirectToIdentityProvider = context =>
-            {
-                Propagators.DefaultTextMapPropagator.Inject(
-                    new PropagationContext(Activity.Current?.Context ?? new ActivityContext(), Baggage.Current),
-                    context.Properties.Items, (objectToAddTo, keyToSet, valueToSetTo) =>
-                    {
-                        objectToAddTo.Add(keyToSet, valueToSetTo);
-                    });
+            OIDCTracePropagator.AddTraceContextToAuthenticationProperties(context);
 
-                return Task.CompletedTask;
-            };
-        });
+            return Task.CompletedTask;
+        };
+    }));
+
+
 
 builder.Services.AddAuthorization(options =>
 {
-    // By default, all incoming requests will be authorized according to 
-    // the default policy
     options.FallbackPolicy = options.DefaultPolicy;
 });
 
@@ -96,53 +83,3 @@ app.MapControllerRoute(
     .AllowAnonymous();
 
 app.Run();
-
-public class OIDCTracePropagator : TraceContextPropagator
-{
-    private readonly IDataProtector _dataProtector;
-    private readonly TraceContextPropagator _internalPropagator = new();
-
-    public OIDCTracePropagator(IDataProtector dataProtector)
-    {
-        _dataProtector = dataProtector;
-    }
-
-    public override PropagationContext Extract<T>(PropagationContext currentContext, T carrier, Func<T, string, IEnumerable<string>> getter)
-    {
-        var baseContext = base.Extract(currentContext, carrier, getter);
-        if (baseContext.ActivityContext.IsValid())
-        {
-            return baseContext;
-        }
-
-        if (carrier is HttpRequest request &&
-            request.Path.HasValue &&
-            request.Path.Value == "/signin-oidc")
-        {
-            var form = request.ReadFormAsync().GetAwaiter().GetResult();
-            var dataFormat = new PropertiesDataFormat(_dataProtector);
-
-            var unprotectedState = dataFormat.Unprotect(form["state"]);
-
-            var contextFromAuthProperties = _internalPropagator.Extract(
-                currentContext,
-                unprotectedState.Items,
-                (dictionaryOfStateValues, keyToFind) =>
-                {
-                    return dictionaryOfStateValues.ContainsKey(keyToFind) ?
-                        new List<string> { dictionaryOfStateValues[keyToFind] } :
-                        Enumerable.Empty<string>();
-                });
-
-            return new PropagationContext(
-                contextFromAuthProperties.ActivityContext, contextFromAuthProperties.Baggage);
-        }
-        return currentContext;
-    }
-
-    public override void Inject<T>(PropagationContext context, T carrier, Action<T, string, string> setter)
-    {
-        _internalPropagator.Inject(context, carrier, setter);
-    }
-
-}
