@@ -1,18 +1,19 @@
 using System.Diagnostics;
-using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.OpenIdConnect;
-using Microsoft.AspNetCore.DataProtection;
+using Microsoft.Extensions.Options;
+using Microsoft.Identity.Web;
 using OpenTelemetry;
 using OpenTelemetry.Context.Propagation;
 
 public class OIDCTracePropagator : TraceContextPropagator
 {
-    private readonly IDataProtector _dataProtector;
+    private readonly IOptionsMonitor<OpenIdConnectOptions> _options;
+
     private readonly TraceContextPropagator _internalPropagator = new();
 
-    public OIDCTracePropagator(IDataProtector dataProtector)
+    public OIDCTracePropagator(IOptionsMonitor<MicrosoftIdentityOptions> options)
     {
-        _dataProtector = dataProtector;
+        _options = options;
     }
 
     public override PropagationContext Extract<T>(PropagationContext currentContext, T carrier, Func<T, string, IEnumerable<string>> getter)
@@ -26,15 +27,15 @@ public class OIDCTracePropagator : TraceContextPropagator
             request.Path.Value == "/signin-oidc")
         {
             var form = request.ReadFormAsync().GetAwaiter().GetResult();
-            var dataFormat = new PropertiesDataFormat(_dataProtector);
 
-            var unprotectedState = dataFormat.Unprotect(form["state"]);
-            if (unprotectedState == null)
+            var unProtectedState = _options.Get(OpenIdConnectDefaults.AuthenticationScheme)
+                .StateDataFormat.Unprotect(form["state"]);
+            if (unProtectedState == null)
                 return currentContext;
 
             var contextFromAuthProperties = _internalPropagator.Extract(
                 currentContext,
-                unprotectedState.Items,
+                unProtectedState.Items,
                 (dictionaryOfStateValues, keyToFind) =>
                 {
                     return dictionaryOfStateValues.ContainsKey(keyToFind) ?
@@ -75,12 +76,13 @@ public class OIDCTracePropagator : TraceContextPropagator
 
 public class OIDCBaggagePropagator : BaggagePropagator
 {
-    private readonly IDataProtector _dataProtector;
+    private readonly IOptionsMonitor<OpenIdConnectOptions> _options;
+
     private readonly BaggagePropagator _internalPropagator = new();
 
-    public OIDCBaggagePropagator(IDataProtector dataProtector)
+    public OIDCBaggagePropagator(IOptionsMonitor<MicrosoftIdentityOptions> options)
     {
-        _dataProtector = dataProtector;
+        _options = options;
     }
 
     public override PropagationContext Extract<T>(PropagationContext currentContext, T carrier, Func<T, string, IEnumerable<string>> getter)
@@ -96,9 +98,9 @@ public class OIDCBaggagePropagator : BaggagePropagator
             request.Path.Value == "/signin-oidc")
         {
             var form = request.ReadFormAsync().GetAwaiter().GetResult();
-            var dataFormat = new PropertiesDataFormat(_dataProtector);
 
-            var unprotectedState = dataFormat.Unprotect(form["state"]);
+            var unprotectedState = _options.Get(OpenIdConnectDefaults.AuthenticationScheme)
+                .StateDataFormat.Unprotect(form["state"]);
             if (unprotectedState == null)
             {
                 return currentContext;

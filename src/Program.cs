@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.OpenIdConnect;
 using Microsoft.AspNetCore.DataProtection;
@@ -24,15 +23,13 @@ builder.Services.AddOpenTelemetry()
          .AddConsoleExporter();
     });
 
-var dataProtector = DataProtectionProvider.Create("oidc").CreateProtector("state-encryption");
+builder.Services.AddSingleton<TextMapPropagator, OIDCTracePropagator>();
+builder.Services.AddSingleton<TextMapPropagator, OIDCBaggagePropagator>(); 
 
 builder.Services.ConfigureOpenTelemetryTracerProvider((sp, tp) =>
 {
-    Sdk.SetDefaultTextMapPropagator(new CompositeTextMapPropagator(
-        new List<TextMapPropagator>() {
-            new OIDCTracePropagator(dataProtector),
-            new BaggagePropagator()
-        }));
+    Sdk.SetDefaultTextMapPropagator(
+        new CompositeTextMapPropagator(sp.GetServices<TextMapPropagator>()));
 });
 
 
@@ -40,17 +37,19 @@ builder.Services.AddRazorPages()
     .AddMicrosoftIdentityUI();
 
 builder.Services.AddAuthentication(OpenIdConnectDefaults.AuthenticationScheme)
-    .AddMicrosoftIdentityWebApp((Action<MicrosoftIdentityOptions>)(i =>
+    .AddMicrosoftIdentityWebApp(i =>
     {
         builder.Configuration.GetSection("AzureADB2C").Bind(i);
-        i.StateDataFormat = new PropertiesDataFormat(dataProtector);
+        i.StateDataFormat = new PropertiesDataFormat(
+            DataProtectionProvider.Create("oidc").CreateProtector("state-encryption")
+        );
         i.Events.OnRedirectToIdentityProvider = context =>
         {
             OIDCTracePropagator.AddTraceContextToAuthenticationProperties(context);
 
             return Task.CompletedTask;
         };
-    }));
+    });
 
 
 
